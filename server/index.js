@@ -14,6 +14,7 @@ const {
 const PORT = process.env.PORT || 8080
 const HEARTBEAT_INTERVAL = 30000
 const STATE_SYNC_INTERVAL = 5000
+const MAX_OPERATION_HISTORY = 1000
 
 class CompetitionState {
   constructor() {
@@ -25,6 +26,8 @@ class CompetitionState {
     this.competitionName = '全国田径锦标赛 - 跳高项目'
     this.lastUpdate = Date.now()
     this.version = 0
+    this.operationHistory = []
+    this.operationIdCounter = 0
   }
 
   get heights() {
@@ -45,9 +48,33 @@ class CompetitionState {
     return this.heights.indexOf(this.currentHeight)
   }
 
-  bumpVersion() {
+  createOperation(type, data, clientId) {
+    this.operationIdCounter++
+    const operation = {
+      id: this.operationIdCounter,
+      type,
+      data,
+      clientId,
+      timestamp: Date.now(),
+      version: this.version
+    }
+    return operation
+  }
+
+  recordOperation(operation) {
+    this.operationHistory.push(operation)
+    if (this.operationHistory.length > MAX_OPERATION_HISTORY) {
+      this.operationHistory.shift()
+    }
+  }
+
+  bumpVersion(operation) {
     this.version++
     this.lastUpdate = Date.now()
+    if (operation) {
+      operation.version = this.version
+      this.recordOperation(operation)
+    }
   }
 
   getState() {
@@ -64,39 +91,58 @@ class CompetitionState {
     }
   }
 
-  initCompetition(name) {
+  getOperationsSinceVersion(version) {
+    if (version >= this.version) return []
+    return this.operationHistory.filter(op => op.version > version)
+  }
+
+  initCompetition(name, clientId) {
+    const op = this.createOperation('init_competition', { name }, clientId)
     if (name) this.competitionName = name
     this.roundType = RoundType.QUALIFICATION
     this.currentHeight = QUALIFICATION_HEIGHTS[0]
     this.currentAthleteIndex = 0
     this.isRunning = true
-    this.bumpVersion()
+    this.bumpVersion(op)
+    return op
   }
 
-  addAthlete(id, name, team, seed) {
+  addAthlete(id, name, team, seed, clientId) {
+    const op = this.createOperation('add_athlete', { id, name, team, seed }, clientId)
     const athlete = createAthlete(id, name, team, seed)
     this.athletes.push(athlete)
-    this.bumpVersion()
-    return athlete
+    this.bumpVersion(op)
+    return { op, athlete }
   }
 
-  addAthletes(athleteList) {
+  addAthletes(athleteList, clientId) {
+    const ops = []
     athleteList.forEach((a, i) => {
-      this.addAthlete(a.id || `athlete-${Date.now()}-${i}`, a.name, a.team, a.seed || i + 1)
+      const result = this.addAthlete(
+        a.id || `athlete-${Date.now()}-${i}`,
+        a.name,
+        a.team,
+        a.seed || i + 1,
+        clientId
+      )
+      ops.push(result.op)
     })
+    return ops
   }
 
-  recordResult(athleteId, height, status) {
+  recordResult(athleteId, height, status, clientId) {
+    const op = this.createOperation('record_result', { athleteId, height, status }, clientId)
     const athlete = this.athletes.find(a => a.id === athleteId)
     if (!athlete) throw new Error('运动员不存在')
     recordAttempt(athlete, height, status)
-    this.bumpVersion()
-    return athlete
+    this.bumpVersion(op)
+    return { op, athlete }
   }
 
-  nextAthlete() {
+  nextAthlete(clientId) {
+    const op = this.createOperation('next_athlete', {}, clientId)
     const active = this.activeAthletes
-    if (active.length === 0) return
+    if (active.length === 0) return null
 
     this.currentAthleteIndex = (this.currentAthleteIndex + 1) % active.length
 
@@ -108,57 +154,74 @@ class CompetitionState {
       this.currentAthleteIndex = (this.currentAthleteIndex + 1) % active.length
       count++
     }
-    this.bumpVersion()
+    this.bumpVersion(op)
+    return op
   }
 
-  setCurrentAthlete(athleteId) {
+  setCurrentAthlete(athleteId, clientId) {
+    const op = this.createOperation('set_current_athlete', { athleteId }, clientId)
     const index = this.activeAthletes.findIndex(a => a.id === athleteId)
     if (index !== -1) {
       this.currentAthleteIndex = index
-      this.bumpVersion()
+      this.bumpVersion(op)
+      return op
     }
+    return null
   }
 
-  nextHeight() {
+  nextHeight(clientId) {
+    const op = this.createOperation('next_height', {}, clientId)
     const index = this.currentHeightIndex
-    if (index === -1 || index >= this.heights.length - 1) return
+    if (index === -1 || index >= this.heights.length - 1) return null
     this.currentHeight = this.heights[index + 1]
     this.currentAthleteIndex = 0
-    this.bumpVersion()
+    this.bumpVersion(op)
+    return op
   }
 
-  prevHeight() {
+  prevHeight(clientId) {
+    const op = this.createOperation('prev_height', {}, clientId)
     const index = this.currentHeightIndex
-    if (index <= 0) return
+    if (index <= 0) return null
     this.currentHeight = this.heights[index - 1]
     this.currentAthleteIndex = 0
-    this.bumpVersion()
+    this.bumpVersion(op)
+    return op
   }
 
-  setHeight(height) {
+  setHeight(height, clientId) {
+    const op = this.createOperation('set_height', { height }, clientId)
     if (this.heights.includes(height)) {
       this.currentHeight = height
       this.currentAthleteIndex = 0
-      this.bumpVersion()
+      this.bumpVersion(op)
+      return op
     }
+    return null
   }
 
-  switchToFinal() {
+  switchToFinal(clientId) {
+    const op = this.createOperation('switch_to_final', {}, clientId)
     const qualified = getQualifiedAthletes(this.athletes, QUALIFICATION_HEIGHTS)
     this.athletes = qualified
     this.roundType = RoundType.FINAL
     this.currentHeight = FINAL_HEIGHTS[0]
     this.currentAthleteIndex = 0
-    this.bumpVersion()
+    this.bumpVersion(op)
+    return op
   }
 
-  resetCompetition() {
+  resetCompetition(clientId) {
+    const op = this.createOperation('reset_competition', {}, clientId)
     this.roundType = RoundType.QUALIFICATION
     this.currentHeight = QUALIFICATION_HEIGHTS[0]
     this.athletes = []
     this.currentAthleteIndex = 0
     this.isRunning = false
-    this.bumpVersion()
+    this.operationHistory = []
+    this.operationIdCounter = 0
+    this.bumpVersion(op)
+    return op
   }
 }
 
@@ -183,8 +246,8 @@ function initializeDemoData() {
     { id: 'a15', name: '朱峰', team: '安徽队', seed: 15 },
     { id: 'a16', name: '秦华', team: '江西队', seed: 16 }
   ]
-  state.addAthletes(demoAthletes)
-  state.initCompetition()
+  state.addAthletes(demoAthletes, 'system')
+  state.initCompetition(undefined, 'system')
 }
 
 initializeDemoData()
@@ -196,20 +259,27 @@ const wss = new WebSocketServer({
 
 const clients = new Map()
 let clientIdCounter = 0
+let isProcessingOperation = false
+const pendingOperations = []
 
 wss.on('connection', (ws, req) => {
   const clientId = ++clientIdCounter
   clients.set(ws, {
     id: clientId,
     isJudge: false,
-    lastPing: Date.now()
+    lastPing: Date.now(),
+    lastKnownVersion: 0
   })
 
   console.log(`[WS] 客户端连接: #${clientId}, 当前连接数: ${clients.size}`)
 
   ws.send(JSON.stringify({
     type: 'state_sync',
-    data: state.getState(),
+    data: {
+      state: state.getState(),
+      isFullSync: true,
+      serverVersion: state.version
+    },
     clientId
   }))
 
@@ -244,6 +314,26 @@ wss.on('connection', (ws, req) => {
   })
 })
 
+function processPendingOperations() {
+  if (isProcessingOperation || pendingOperations.length === 0) return
+
+  isProcessingOperation = true
+  const { ws, msg, client } = pendingOperations.shift()
+
+  try {
+    executeOperation(ws, msg, client)
+  } catch (err) {
+    console.error('[WS] 操作执行错误:', err.message)
+    ws.send(JSON.stringify({
+      type: 'error',
+      data: { message: err.message }
+    }))
+  } finally {
+    isProcessingOperation = false
+    setImmediate(processPendingOperations)
+  }
+}
+
 function handleMessage(ws, msg) {
   const client = clients.get(ws)
   if (!client) return
@@ -261,11 +351,28 @@ function handleMessage(ws, msg) {
     case 'get_state':
       ws.send(JSON.stringify({
         type: 'state_sync',
-        data: state.getState()
+        data: {
+          state: state.getState(),
+          isFullSync: true,
+          serverVersion: state.version
+        }
       }))
       break
 
+    case 'sync_version':
+      handleVersionSync(ws, msg.data, client)
+      break
+
     case 'record_result':
+    case 'next_athlete':
+    case 'set_current_athlete':
+    case 'next_height':
+    case 'prev_height':
+    case 'set_height':
+    case 'switch_to_final':
+    case 'init_competition':
+    case 'reset_competition':
+    case 'add_athlete':
       if (!client.isJudge) {
         ws.send(JSON.stringify({
           type: 'error',
@@ -273,76 +380,8 @@ function handleMessage(ws, msg) {
         }))
         return
       }
-      try {
-        const { athleteId, height, status } = msg.data
-        state.recordResult(athleteId, height, status)
-        broadcastState()
-      } catch (err) {
-        ws.send(JSON.stringify({
-          type: 'error',
-          data: { message: err.message }
-        }))
-      }
-      break
-
-    case 'next_athlete':
-      if (!client.isJudge) return
-      state.nextAthlete()
-      broadcastState()
-      break
-
-    case 'set_current_athlete':
-      if (!client.isJudge) return
-      state.setCurrentAthlete(msg.data.athleteId)
-      broadcastState()
-      break
-
-    case 'next_height':
-      if (!client.isJudge) return
-      state.nextHeight()
-      broadcastState()
-      break
-
-    case 'prev_height':
-      if (!client.isJudge) return
-      state.prevHeight()
-      broadcastState()
-      break
-
-    case 'set_height':
-      if (!client.isJudge) return
-      state.setHeight(msg.data.height)
-      broadcastState()
-      break
-
-    case 'switch_to_final':
-      if (!client.isJudge) return
-      state.switchToFinal()
-      broadcastState()
-      break
-
-    case 'init_competition':
-      if (!client.isJudge) return
-      state.initCompetition(msg.data?.name)
-      broadcastState()
-      break
-
-    case 'reset_competition':
-      if (!client.isJudge) return
-      state.resetCompetition()
-      initializeDemoData()
-      broadcastState()
-      break
-
-    case 'add_athlete':
-      if (!client.isJudge) return
-      state.addAthlete(
-        msg.data.id,
-        msg.data.name,
-        msg.data.team,
-        msg.data.seed
-      )
-      broadcastState()
+      pendingOperations.push({ ws, msg, client })
+      processPendingOperations()
       break
 
     case 'ping':
@@ -354,6 +393,335 @@ function handleMessage(ws, msg) {
   }
 }
 
+function handleVersionSync(ws, data, client) {
+  const clientVersion = data?.clientVersion || 0
+  client.lastKnownVersion = clientVersion
+
+  const operations = state.getOperationsSinceVersion(clientVersion)
+
+  if (operations.length === 0) {
+    ws.send(JSON.stringify({
+      type: 'version_check',
+      data: {
+        inSync: true,
+        serverVersion: state.version,
+        clientVersion
+      }
+    }))
+  } else if (operations.length <= 50) {
+    ws.send(JSON.stringify({
+      type: 'state_sync',
+      data: {
+        state: state.getState(),
+        isFullSync: true,
+        serverVersion: state.version,
+        clientVersion,
+        operations: operations.length
+      }
+    }))
+  } else {
+    ws.send(JSON.stringify({
+      type: 'state_sync',
+      data: {
+        state: state.getState(),
+        isFullSync: true,
+        serverVersion: state.version,
+        clientVersion,
+        operations: operations.length
+      }
+    }))
+  }
+}
+
+function executeOperation(ws, msg, client) {
+  const clientId = client.id
+
+  switch (msg.type) {
+    case 'record_result': {
+      const { athleteId, height, status, clientVersion } = msg.data
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const result = state.recordResult(athleteId, height, status, clientId)
+      ws.send(JSON.stringify({
+        type: 'operation_ack',
+        data: {
+          operationId: result.op.id,
+          type: msg.type,
+          serverVersion: state.version,
+          success: true
+        }
+      }))
+      broadcastState()
+      break
+    }
+
+    case 'next_athlete': {
+      const { clientVersion } = msg.data || {}
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const op = state.nextAthlete(clientId)
+      if (op) {
+        ws.send(JSON.stringify({
+          type: 'operation_ack',
+          data: {
+            operationId: op.id,
+            type: msg.type,
+            serverVersion: state.version,
+            success: true
+          }
+        }))
+        broadcastState()
+      }
+      break
+    }
+
+    case 'set_current_athlete': {
+      const { athleteId, clientVersion } = msg.data
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const op = state.setCurrentAthlete(athleteId, clientId)
+      if (op) {
+        ws.send(JSON.stringify({
+          type: 'operation_ack',
+          data: {
+            operationId: op.id,
+            type: msg.type,
+            serverVersion: state.version,
+            success: true
+          }
+        }))
+        broadcastState()
+      }
+      break
+    }
+
+    case 'next_height': {
+      const { clientVersion } = msg.data || {}
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const op = state.nextHeight(clientId)
+      if (op) {
+        ws.send(JSON.stringify({
+          type: 'operation_ack',
+          data: {
+            operationId: op.id,
+            type: msg.type,
+            serverVersion: state.version,
+            success: true
+          }
+        }))
+        broadcastState()
+      }
+      break
+    }
+
+    case 'prev_height': {
+      const { clientVersion } = msg.data || {}
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const op = state.prevHeight(clientId)
+      if (op) {
+        ws.send(JSON.stringify({
+          type: 'operation_ack',
+          data: {
+            operationId: op.id,
+            type: msg.type,
+            serverVersion: state.version,
+            success: true
+          }
+        }))
+        broadcastState()
+      }
+      break
+    }
+
+    case 'set_height': {
+      const { height, clientVersion } = msg.data
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const op = state.setHeight(height, clientId)
+      if (op) {
+        ws.send(JSON.stringify({
+          type: 'operation_ack',
+          data: {
+            operationId: op.id,
+            type: msg.type,
+            serverVersion: state.version,
+            success: true
+          }
+        }))
+        broadcastState()
+      }
+      break
+    }
+
+    case 'switch_to_final': {
+      const { clientVersion } = msg.data || {}
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const op = state.switchToFinal(clientId)
+      if (op) {
+        ws.send(JSON.stringify({
+          type: 'operation_ack',
+          data: {
+            operationId: op.id,
+            type: msg.type,
+            serverVersion: state.version,
+            success: true
+          }
+        }))
+        broadcastState()
+      }
+      break
+    }
+
+    case 'init_competition': {
+      const { name, clientVersion } = msg.data || {}
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const op = state.initCompetition(name, clientId)
+      ws.send(JSON.stringify({
+        type: 'operation_ack',
+        data: {
+          operationId: op.id,
+          type: msg.type,
+          serverVersion: state.version,
+          success: true
+        }
+      }))
+      broadcastState()
+      break
+    }
+
+    case 'reset_competition': {
+      const { clientVersion } = msg.data || {}
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const op = state.resetCompetition(clientId)
+      initializeDemoData()
+      ws.send(JSON.stringify({
+        type: 'operation_ack',
+        data: {
+          operationId: op.id,
+          type: msg.type,
+          serverVersion: state.version,
+          success: true
+        }
+      }))
+      broadcastState()
+      break
+    }
+
+    case 'add_athlete': {
+      const { id, name, team, seed, clientVersion } = msg.data
+      if (clientVersion !== undefined && clientVersion !== state.version) {
+        ws.send(JSON.stringify({
+          type: 'version_conflict',
+          data: {
+            clientVersion,
+            serverVersion: state.version,
+            message: '版本不匹配，请先同步状态'
+          }
+        }))
+        return
+      }
+      const result = state.addAthlete(id, name, team, seed, clientId)
+      ws.send(JSON.stringify({
+        type: 'operation_ack',
+        data: {
+          operationId: result.op.id,
+          type: msg.type,
+          serverVersion: state.version,
+          success: true
+        }
+      }))
+      broadcastState()
+      break
+    }
+  }
+}
+
 let lastBroadcastVersion = -1
 
 function broadcastState() {
@@ -361,17 +729,23 @@ function broadcastState() {
 
   const stateData = JSON.stringify({
     type: 'state_sync',
-    data: state.getState()
+    data: {
+      state: state.getState(),
+      isFullSync: true,
+      serverVersion: state.version
+    }
   })
 
   lastBroadcastVersion = state.version
 
   let successCount = 0
-  for (const ws of clients.keys()) {
+  for (const [ws, client] of clients.entries()) {
     if (ws.readyState === ws.OPEN) {
       ws.send(stateData, (err) => {
         if (err) {
           console.error('[WS] 广播失败:', err.message)
+        } else {
+          client.lastKnownVersion = state.version
         }
       })
       successCount++
@@ -411,6 +785,7 @@ wss.on('listening', () => {
 ║  WebSocket 服务已启动                                     ║
 ║  端口: ${PORT}                                               ║
 ║  支持并发: 1000+ 客户端                                    ║
+║  版本控制: v2.0 (带版本冲突检测)                          ║
 ║                                                          ║
 ║  裁判端: http://localhost:3000/#/judge                   ║
 ║  主屏幕: http://localhost:3000/#/display                 ║

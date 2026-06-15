@@ -10,19 +10,44 @@
           <span class="height-badge">
             当前高度: <b>{{ store.currentHeight.toFixed(2) }}m</b>
           </span>
+          <span class="version-badge" v-if="store.version > 0">
+            v{{ store.version }}
+          </span>
         </div>
       </div>
       <div class="header-right">
         <div class="quick-actions">
-          <button class="q-btn" @click="handlePrevHeight" :disabled="!canPrevHeight">← 上一高度</button>
-          <button class="q-btn primary" @click="handleNextHeight" :disabled="!canNextHeight">下一高度 →</button>
+          <button class="q-btn" @click="handlePrevHeight" :disabled="!canPrevHeight || !ws.isConnected.value">← 上一高度</button>
+          <button class="q-btn primary" @click="handleNextHeight" :disabled="!canNextHeight || !ws.isConnected.value">下一高度 →</button>
         </div>
-        <div class="connection-status" :class="statusClass">
+        <div class="connection-status" :class="statusClass" @click="handleStatusClick">
           <span class="status-dot"></span>
           {{ statusText }}
+          <span v-if="ws.pendingOperations.value.length > 0" class="pending-badge">
+            {{ ws.pendingOperations.value.length }}
+          </span>
         </div>
       </div>
     </header>
+
+    <div v-if="showReconnectDialog" class="reconnect-overlay">
+      <div class="reconnect-dialog">
+        <div class="dialog-icon">⚠️</div>
+        <h3 class="dialog-title">网络已恢复</h3>
+        <p class="dialog-desc">
+          检测到您在断网期间有 <b>{{ ws.pendingOperations.value.length }}</b> 条操作未提交。
+          服务端状态已更新到 v{{ store.version }}。
+        </p>
+        <div class="dialog-actions">
+          <button class="dialog-btn cancel" @click="handleDiscardOperations">
+            丢弃操作
+          </button>
+          <button class="dialog-btn confirm" @click="handleResubmitOperations">
+            重新提交
+          </button>
+        </div>
+      </div>
+    </div>
 
     <div class="main-content">
       <div class="top-panel">
@@ -204,7 +229,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useCompetitionStore } from '../stores/competition'
 import { useWebSocket } from '../composables/useWebSocket'
 import {
@@ -217,6 +242,8 @@ import {
 const store = useCompetitionStore()
 const ws = useWebSocket(true)
 const selectedAthleteId = ref(null)
+const showReconnectDialog = ref(false)
+const wasDisconnected = ref(false)
 
 const statusClass = computed(() => store.connectionStatus)
 const statusText = computed(() => {
@@ -229,6 +256,34 @@ const statusText = computed(() => {
   }
   return map[store.connectionStatus] || store.connectionStatus
 })
+
+watch(() => store.connectionStatus, (newStatus, oldStatus) => {
+  if (oldStatus === 'disconnected' && newStatus === 'connected' && wasDisconnected.value) {
+    if (ws.pendingOperations.value.length > 0) {
+      showReconnectDialog.value = true
+    }
+    wasDisconnected.value = false
+  }
+  if (newStatus === 'disconnected') {
+    wasDisconnected.value = true
+  }
+})
+
+function handleStatusClick() {
+  if (store.connectionStatus === 'disconnected' || store.connectionStatus === 'failed') {
+    ws.connect()
+  }
+}
+
+function handleDiscardOperations() {
+  ws.clearPendingOperations()
+  showReconnectDialog.value = false
+}
+
+function handleResubmitOperations() {
+  ws.submitPendingOperations()
+  showReconnectDialog.value = false
+}
 
 const canPrevHeight = computed(() => store.currentHeightIndex > 0)
 const canNextHeight = computed(() => store.currentHeightIndex < store.heights.length - 1)
@@ -492,6 +547,17 @@ onUnmounted(() => {
   margin-left: 4px;
 }
 
+.version-badge {
+  padding: 5px 12px;
+  border-radius: 14px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--text-secondary);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  font-family: monospace;
+}
+
 .header-right {
   display: flex;
   align-items: center;
@@ -538,6 +604,26 @@ onUnmounted(() => {
   padding: 6px 12px;
   border-radius: 12px;
   background: rgba(148, 163, 184, 0.08);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.connection-status:hover {
+  background: rgba(148, 163, 184, 0.15);
+}
+
+.pending-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--warning);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .status-dot {
@@ -1234,5 +1320,90 @@ onUnmounted(() => {
 
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.45);
+}
+
+.reconnect-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+.reconnect-dialog {
+  background: linear-gradient(135deg, #1a1f3a 0%, #0a0e1a 100%);
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  padding: 32px 40px;
+  max-width: 420px;
+  width: 90%;
+  text-align: center;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.dialog-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.dialog-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 12px;
+}
+
+.dialog-desc {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin-bottom: 24px;
+}
+
+.dialog-desc b {
+  color: var(--warning);
+  font-weight: 700;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.dialog-btn {
+  padding: 10px 24px;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.dialog-btn.cancel {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-secondary);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.dialog-btn.cancel:hover {
+  background: rgba(148, 163, 184, 0.25);
+}
+
+.dialog-btn.confirm {
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  color: white;
+}
+
+.dialog-btn.confirm:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 15px rgba(0, 212, 255, 0.3);
 }
 </style>

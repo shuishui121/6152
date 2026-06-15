@@ -23,8 +23,10 @@ export const useCompetitionStore = defineStore('competition', () => {
   const isRunning = ref(false)
   const competitionName = ref('全国田径锦标赛 - 跳高项目')
   const lastUpdate = ref(Date.now())
+  const version = ref(0)
   const connectionStatus = ref('disconnected')
   const wsError = ref(null)
+  const hasUnsubmittedOperations = ref(false)
 
   const heights = computed(() => {
     return roundType.value === RoundType.QUALIFICATION
@@ -181,6 +183,7 @@ export const useCompetitionStore = defineStore('competition', () => {
     if (state.isRunning !== undefined) isRunning.value = state.isRunning
     if (state.competitionName) competitionName.value = state.competitionName
     if (state.lastUpdate) lastUpdate.value = state.lastUpdate
+    if (state.version !== undefined) version.value = state.version
   }
 
   function getState() {
@@ -191,7 +194,8 @@ export const useCompetitionStore = defineStore('competition', () => {
       currentAthleteIndex: currentAthleteIndex.value,
       isRunning: isRunning.value,
       competitionName: competitionName.value,
-      lastUpdate: lastUpdate.value
+      lastUpdate: lastUpdate.value,
+      version: version.value
     }
   }
 
@@ -212,8 +216,10 @@ export const useCompetitionStore = defineStore('competition', () => {
     isRunning,
     competitionName,
     lastUpdate,
+    version,
     connectionStatus,
     wsError,
+    hasUnsubmittedOperations,
     heights,
     currentHeightIndex,
     rankings,

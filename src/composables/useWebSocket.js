@@ -1,9 +1,11 @@
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useCompetitionStore } from '../stores/competition'
 
 const WS_URL = 'ws://localhost:8080'
-const RECONNECT_DELAY = 3000
-const MAX_RECONNECT_ATTEMPTS = 10
+const INITIAL_RECONNECT_DELAY = 1000
+const MAX_RECONNECT_DELAY = 30000
+const MAX_RECONNECT_ATTEMPTS = 20
+const PING_INTERVAL = 15000
 
 export function useWebSocket(isJudge = false) {
   const store = useCompetitionStore()
@@ -11,8 +13,15 @@ export function useWebSocket(isJudge = false) {
   const isConnected = ref(false)
   const reconnectCount = ref(0)
   const latency = ref(0)
+  const clientId = ref(null)
+  const pendingOperations = ref([])
+  const hasPendingOperations = computed(() => pendingOperations.value.length > 0)
+  const isReconnecting = ref(false)
+  const lastDisconnectTime = ref(null)
+
   let reconnectTimer = null
   let pingTimer = null
+  let reconnectDelay = INITIAL_RECONNECT_DELAY
 
   function connect() {
     if (ws.value && ws.value.readyState === WebSocket.OPEN) {
@@ -28,13 +37,20 @@ export function useWebSocket(isJudge = false) {
         isConnected.value = true
         store.connectionStatus = 'connected'
         reconnectCount.value = 0
+        reconnectDelay = INITIAL_RECONNECT_DELAY
         store.wsError = null
+        isReconnecting.value = false
 
         if (isJudge) {
           sendMessage('register_judge')
         }
 
-        sendMessage('get_state')
+        if (store.version > 0) {
+          sendMessage('sync_version', { clientVersion: store.version })
+        } else {
+          sendMessage('get_state')
+        }
+
         startPing()
       }
 
@@ -51,6 +67,7 @@ export function useWebSocket(isJudge = false) {
         console.log(`[WS] 连接关闭: code=${event.code}, reason=${event.reason}`)
         isConnected.value = false
         store.connectionStatus = 'disconnected'
+        lastDisconnectTime.value = Date.now()
         stopPing()
         scheduleReconnect()
       }
@@ -71,7 +88,22 @@ export function useWebSocket(isJudge = false) {
   function handleMessage(msg) {
     switch (msg.type) {
       case 'state_sync':
-        store.setState(msg.data)
+        handleStateSync(msg.data)
+        if (msg.clientId) {
+          clientId.value = msg.clientId
+        }
+        break
+
+      case 'version_check':
+        handleVersionCheck(msg.data)
+        break
+
+      case 'version_conflict':
+        handleVersionConflict(msg.data)
+        break
+
+      case 'operation_ack':
+        handleOperationAck(msg.data)
         break
 
       case 'pong':
@@ -93,6 +125,57 @@ export function useWebSocket(isJudge = false) {
     }
   }
 
+  function handleStateSync(data) {
+    const { state, isFullSync, serverVersion, operations } = data
+
+    if (isFullSync) {
+      const hasVersionMismatch = store.version > 0 && store.version !== serverVersion
+      const hasPending = pendingOperations.value.length > 0
+
+      store.setState(state)
+      store.version = serverVersion
+
+      if (hasVersionMismatch && isJudge) {
+        console.log(`[WS] 状态已同步: v${store.version}, 服务端领先 ${operations || 0} 个操作`)
+      }
+
+      if (hasPending && isJudge) {
+        store.hasUnsubmittedOperations = true
+      }
+    }
+  }
+
+  function handleVersionCheck(data) {
+    const { inSync, serverVersion, clientVersion } = data
+    if (inSync) {
+      console.log('[WS] 版本一致，无需同步')
+      store.version = serverVersion
+    } else {
+      sendMessage('get_state')
+    }
+  }
+
+  function handleVersionConflict(data) {
+    const { clientVersion, serverVersion, message } = data
+    console.warn(`[WS] 版本冲突: 客户端v${clientVersion}, 服务端v${serverVersion}`)
+    store.wsError = message || '版本冲突，正在同步...'
+    sendMessage('get_state')
+  }
+
+  function handleOperationAck(data) {
+    const { operationId, type, serverVersion, success } = data
+    if (success) {
+      store.version = serverVersion
+      const index = pendingOperations.value.findIndex(op => op.tempId === operationId)
+      if (index !== -1) {
+        pendingOperations.value.splice(index, 1)
+      }
+      if (pendingOperations.value.length === 0) {
+        store.hasUnsubmittedOperations = false
+      }
+    }
+  }
+
   function sendMessage(type, data = {}) {
     if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
       console.warn('[WS] 连接未就绪，消息未发送:', type)
@@ -100,12 +183,62 @@ export function useWebSocket(isJudge = false) {
     }
 
     try {
-      ws.value.send(JSON.stringify({ type, data }))
+      const message = { type, data }
+      ws.value.send(JSON.stringify(message))
       return true
     } catch (err) {
       console.error('[WS] 消息发送失败:', err)
       return false
     }
+  }
+
+  function queueOperation(type, data = {}) {
+    if (!isJudge) return false
+
+    const tempId = Date.now() + Math.random()
+    const operation = {
+      tempId,
+      type,
+      data: { ...data, clientVersion: store.version },
+      timestamp: Date.now()
+    }
+
+    if (isConnected.value) {
+      const sent = sendMessage(type, { ...data, clientVersion: store.version })
+      if (!sent) {
+        pendingOperations.value.push(operation)
+        store.hasUnsubmittedOperations = true
+      }
+    } else {
+      pendingOperations.value.push(operation)
+      store.hasUnsubmittedOperations = true
+    }
+
+    return true
+  }
+
+  function submitPendingOperations() {
+    if (!isConnected.value || pendingOperations.value.length === 0) return
+
+    console.log(`[WS] 提交 ${pendingOperations.value.length} 个待处理操作`)
+
+    const operations = [...pendingOperations.value]
+    pendingOperations.value = []
+
+    operations.forEach((op, index) => {
+      setTimeout(() => {
+        if (isConnected.value) {
+          sendMessage(op.type, { ...op.data, clientVersion: store.version })
+        } else {
+          pendingOperations.value.push(op)
+        }
+      }, index * 100)
+    })
+  }
+
+  function clearPendingOperations() {
+    pendingOperations.value = []
+    store.hasUnsubmittedOperations = false
   }
 
   function startPing() {
@@ -114,7 +247,7 @@ export function useWebSocket(isJudge = false) {
       if (isConnected.value) {
         sendMessage('ping')
       }
-    }, 15000)
+    }, PING_INTERVAL)
   }
 
   function stopPing() {
@@ -136,10 +269,13 @@ export function useWebSocket(isJudge = false) {
     }
 
     reconnectCount.value++
-    const delay = RECONNECT_DELAY * Math.min(reconnectCount.value, 5)
-    console.log(`[WS] ${delay / 1000}秒后尝试第 ${reconnectCount.value} 次重连...`)
+    const delay = reconnectDelay
+    console.log(`[WS] ${(delay / 1000).toFixed(1)}秒后尝试第 ${reconnectCount.value} 次重连...`)
+
+    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY)
 
     reconnectTimer = setTimeout(() => {
+      isReconnecting.value = true
       connect()
     }, delay)
   }
@@ -158,44 +294,50 @@ export function useWebSocket(isJudge = false) {
     store.connectionStatus = 'disconnected'
   }
 
+  function forceSync() {
+    if (isConnected.value) {
+      sendMessage('get_state')
+    }
+  }
+
   function recordResult(athleteId, height, status) {
-    return sendMessage('record_result', { athleteId, height, status })
+    return queueOperation('record_result', { athleteId, height, status })
   }
 
   function nextAthlete() {
-    return sendMessage('next_athlete')
+    return queueOperation('next_athlete', {})
   }
 
   function setCurrentAthlete(athleteId) {
-    return sendMessage('set_current_athlete', { athleteId })
+    return queueOperation('set_current_athlete', { athleteId })
   }
 
   function nextHeight() {
-    return sendMessage('next_height')
+    return queueOperation('next_height', {})
   }
 
   function prevHeight() {
-    return sendMessage('prev_height')
+    return queueOperation('prev_height', {})
   }
 
   function setHeight(height) {
-    return sendMessage('set_height', { height })
+    return queueOperation('set_height', { height })
   }
 
   function switchToFinal() {
-    return sendMessage('switch_to_final')
+    return queueOperation('switch_to_final', {})
   }
 
   function initCompetition(name) {
-    return sendMessage('init_competition', { name })
+    return queueOperation('init_competition', { name })
   }
 
   function resetCompetition() {
-    return sendMessage('reset_competition')
+    return queueOperation('reset_competition', {})
   }
 
   function addAthlete(athlete) {
-    return sendMessage('add_athlete', athlete)
+    return queueOperation('add_athlete', athlete)
   }
 
   onMounted(() => {
@@ -211,9 +353,17 @@ export function useWebSocket(isJudge = false) {
     isConnected,
     latency,
     reconnectCount,
+    clientId,
+    pendingOperations,
+    hasPendingOperations,
+    isReconnecting,
+    lastDisconnectTime,
     connect,
     disconnect,
+    forceSync,
     sendMessage,
+    submitPendingOperations,
+    clearPendingOperations,
     recordResult,
     nextAthlete,
     setCurrentAthlete,
