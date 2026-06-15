@@ -1,0 +1,24 @@
+{
+  "name": "high-jump-scoring-system",
+  "version": "1.0.0",
+  "description": "全国田径锦标赛跳高项目实时计分系统",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "node server/index.js",
+    "dev:client": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.4.0",
+    "pinia": "^2.1.7",
+    "vue-router": "^4.2.5",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "vite": "^5.0.0",
+    "concurrently": "^8.2.2"
+  }
+}
